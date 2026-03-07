@@ -88,6 +88,7 @@ if uploaded_file is not None and model_loaded:
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
+    
     # IMPORTANT: Enable gradients on the input image for CAM calculation
     img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
@@ -106,17 +107,16 @@ if uploaded_file is not None and model_loaded:
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. MAKE PREDICTION & BACKWARD PASS ---
+    # --- 6. MAKE PREDICTION & REVERSE POLARITY ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    # THE FIX: Gradient Polarity Reversal
-    # If the model thinks it's Benign, we must flip the sign to highlight Benign features!
+    # The Fix: Ask the model what features correlate with its specific decision
     if prob >= 0.5:
-        output.backward() # What makes it Malignant?
+        output.backward() # Calculates gradients for Malignant
     else:
-        (-output).backward() # What makes it Benign?
+        (-output).backward() # Calculates gradients for Benign
     
     # --- 7. GENERATE HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
