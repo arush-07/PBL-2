@@ -92,45 +92,60 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. FORWARD PASS ---
+    # --- 5. HOOK INTO LAYER 4 FOR SPATIAL DATA ---
+    feature_blobs = []
+    def hook_feature(module, input, output):
+        # Grab the output of layer4 (which is a 7x7 spatial map!)
+        feature_blobs.append(output.cpu().data.numpy())
+        
+    # Target layer 4 of ResNet50
+    target_layer = model.deep_extractor[7] 
+    handle = target_layer.register_forward_hook(hook_feature)
+    
+    # --- 6. FORWARD PASS ---
     with torch.no_grad():
-        visual_features = model.deep_extractor(img_tensor)
-        flattened_features = torch.flatten(visual_features, 1)
-        fused_features = model.fusion_module(flattened_features, dummy_radiomics)
-        output = model.classifier(fused_features)
+        output = model(img_tensor, dummy_radiomics)
         prob = torch.sigmoid(output).item()
         
-    # --- 6. TISSUE ACTIVATION MAP (DEBUGGED) ---
-    activations = visual_features.cpu().numpy()[0]
+    handle.remove() # Clean up the hook
+        
+    # --- 7. TISSUE ACTIVATION MAP ---
+    # Extract the spatial activations (Shape: [1, 2048, 7, 7]) -> [2048, 7, 7]
+    activations = feature_blobs[0][0]
     
-    # Use MAX to prevent the hot spots from being watered down
-    cam = np.max(activations, axis=0)
+    # Take the mean across all 2048 filters to see overall model attention
+    cam = np.mean(activations, axis=0)
+    
+    # Normalize strictly between 0 and 1
     cam = np.maximum(cam, 0)
-    
-    # Normalize safely
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
     else:
         cam = np.zeros_like(cam)
 
-    # Resize to match original image dimensions
+    # Resize the 7x7 grid to original image size using smooth interpolation
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
-    # Create the high-res overlay
+    # Add a subtle noise filter so the background doesn't glow blue/green
+    cam[cam < 0.25] = 0.0
+
+    # --- 8. CREATE THE OVERLAY ---
     orig_img_array = np.array(image)
+    
+    # Convert the normalized CAM to a heatmap colorspace
     heatmap_8bit = np.uint8(255 * cam)
     heatmap_color = cv2.applyColorMap(heatmap_8bit, cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Standard, foolproof OpenCV blending (50% image, 50% heatmap)
-    overlay = cv2.addWeighted(orig_img_array, 0.5, heatmap_color, 0.5, 0)
+    # Standard blending: 60% original image, 40% heatmap
+    overlay = cv2.addWeighted(orig_img_array, 0.6, heatmap_color, 0.4, 0)
 
     with col2:
-        st.image(overlay, caption='ResNet50 Max Activation Map', use_container_width=True)
+        st.image(overlay, caption='ResNet50 Spatial Activation Map', use_container_width=True)
 
-    # --- 7. DISPLAY RESULTS ---
+    # --- 9. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
