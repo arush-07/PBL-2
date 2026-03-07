@@ -93,15 +93,13 @@ if uploaded_file is not None and model_loaded:
     # --- 5. PURE STANDARD GRAD-CAM WITH POLARITY FIX ---
     model.zero_grad()
     
-    # Forward pass manually up to Layer 4 (the final 7x7 spatial grid)
     x = img_tensor
     for i in range(8): 
         x = model.deep_extractor[i](x)
     
     features = x 
-    features.retain_grad() # Save gradients for this specific layer
+    features.retain_grad() 
     
-    # Finish the forward pass
     x = model.deep_extractor[8](features)
     flattened = torch.flatten(x, 1)
     fused = model.fusion_module(flattened, dummy_radiomics)
@@ -115,7 +113,6 @@ if uploaded_file is not None and model_loaded:
     else:
         (-output).backward() # What makes this Benign?
     
-    # Extract gradients and activations
     grads = features.grad[0] 
     acts = features.detach()[0] 
     
@@ -126,7 +123,7 @@ if uploaded_file is not None and model_loaded:
     # ReLU to keep only positive signals
     cam = np.maximum(cam, 0)
     
-    # Normalize between 0 and 1
+    # Normalize safely
     cam_max = np.max(cam)
     if cam_max > 0:
         cam = cam / cam_max
@@ -134,15 +131,13 @@ if uploaded_file is not None and model_loaded:
     # --- 6. SIMPLE, CLEAN OVERLAY ---
     orig_img_array = np.array(image)
     
-    # Resize the heatmap to match the original image smoothly
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
-    # Apply colormap
     heatmap_color = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Simple Alpha Blending: Keeps the empty background dark and transparent
-    alpha = cam_resized[..., np.newaxis] * 0.5 
+    # Dynamic Alpha Blending: Keeps the empty background dark and transparent
+    alpha = cam_resized[..., np.newaxis] * 0.6 
     overlay = (orig_img_array * (1 - alpha) + heatmap_color * alpha).astype(np.uint8)
 
     with col2:
