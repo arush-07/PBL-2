@@ -9,9 +9,9 @@ import numpy as np
 import cv2
 
 # --- 1. SET UP THE PAGE ---
-st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="wide")
+st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM Map.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Tissue Activation Map.")
 
 # --- 2. DEFINE THE ADVANCED AI ARCHITECTURE ---
 @st.cache_resource 
@@ -62,27 +62,6 @@ def load_model():
     model.eval()
     return model, device
 
-# --- 3. MEDICAL PREPROCESSING (THE ANTI-CHEAT FILTER) ---
-def isolate_breast_tissue(image_pil):
-    """Uses OpenCV to find the breast tissue and crop out text labels/noise."""
-    img_arr = np.array(image_pil.convert('L')) # Convert to grayscale
-    
-    # Threshold to isolate tissue (bright) from background (dark)
-    _, thresh = cv2.threshold(img_arr, 15, 255, cv2.THRESH_BINARY)
-    
-    # Find all shapes in the image
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return image_pil
-
-    # The breast is the largest object. Text like "RCC" is tiny in comparison.
-    largest_contour = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(largest_contour)
-
-    # Crop the image exactly to the biological tissue
-    cropped_img = np.array(image_pil)[y:y+h, x:x+w]
-    return Image.fromarray(cropped_img)
-
 try:
     model, device = load_model()
     model_loaded = True
@@ -91,87 +70,85 @@ except Exception as e:
     st.info("Ensure 'adaptive_hybrid_breast_cancer_model.pth' is uploaded to the same folder.")
     model_loaded = False
 
-# --- 4. UI: IMAGE UPLOAD ---
+# --- 3. UI: IMAGE UPLOAD ---
 uploaded_file = st.file_uploader("Choose a medical image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None and model_loaded:
-    col1, col2, col3 = st.columns(3)
+    # Back to a clean 2-column layout
+    col1, col2 = st.columns(2, gap="large")
     
-    original_image = Image.open(uploaded_file).convert('RGB')
-    
-    # Apply our new algorithmic crop!
-    processed_image = isolate_breast_tissue(original_image)
+    image = Image.open(uploaded_file).convert('RGB')
     
     with col1:
-        st.image(original_image, caption='1. Raw Upload', use_container_width=True)
-    with col2:
-        st.image(processed_image, caption='2. AI View (Auto-Cropped)', use_container_width=True)
+        st.image(image, caption='Original Scan', use_container_width=True)
     
-    st.write("🔍 Analyzing biological tissue and generating targeted Grad-CAM...")
+    st.write("🔍 Analyzing tissue density and generating Activation Map...")
     
-    # --- 5. PREPARE IMAGE ---
+    # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    img_tensor = transform(processed_image).unsqueeze(0).to(device)
+    img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 6. THE FOOLPROOF, HOOK-LESS GRAD-CAM ---
-    model.zero_grad()
-    
-    x = img_tensor
-    for i in range(8): 
-        x = model.deep_extractor[i](x)
-    
-    layer4_features = x 
-    layer4_features.retain_grad() 
-    
-    x = model.deep_extractor[8](layer4_features) 
-    flattened_features = torch.flatten(x, 1)
-    fused_features = model.fusion_module(flattened_features, dummy_radiomics)
-    output = model.classifier(fused_features)
-    
-    prob = torch.sigmoid(output).item()
-    
-    if prob >= 0.5:
-        output.backward() 
-    else:
-        (-output).backward() 
+    # --- 5. L2 NORM ACTIVATION MAPPING (Unbiased) ---
+    with torch.no_grad():
+        # Step through the network up to Layer 4
+        x = img_tensor
+        for i in range(8): 
+            x = model.deep_extractor[i](x)
+            
+        activations = x.cpu().numpy()[0] # Shape: [2048, 7, 7]
         
-    grads = layer4_features.grad 
-    activations = layer4_features.detach() 
+        # Finish the math for the prediction
+        x = model.deep_extractor[8](x) 
+        flattened_features = torch.flatten(x, 1)
+        fused_features = model.fusion_module(flattened_features, dummy_radiomics)
+        output = model.classifier(fused_features)
+        prob = torch.sigmoid(output).item()
     
-    weights = torch.mean(grads, dim=(2, 3), keepdim=True) 
-    cam = torch.sum(weights * activations, dim=1).squeeze(0).cpu().numpy()
-    cam = np.maximum(cam, 0)
+    # Calculate the L2 Norm (Magnitude) of the spatial filters
+    cam = np.linalg.norm(activations, axis=0)
     
+    # Normalize between 0 and 1
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
     else:
         cam = np.zeros_like(cam)
 
-    # --- 7. OVERLAY GENERATION (Applied to the cropped image) ---
-    orig_width, orig_height = processed_image.size
+    # --- 6. SMOOTH OVERLAY GENERATION ---
+    orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
-    cam[cam < 0.2] = 0.0  
     
-    orig_img_array = np.array(processed_image)
+    # Apply a Gaussian blur to smooth the heatmap edges professionally
+    cam = cv2.GaussianBlur(cam, (51, 51), 0)
+    
+    # Clean up background noise
+    cam[cam < 0.4] = 0.0  
+    
+    # Renormalize after blur and cut
+    cam_max = np.max(cam)
+    if cam_max > 0:
+        cam = cam / cam_max
+    
+    orig_img_array = np.array(image)
     heatmap_8bit = np.uint8(255 * cam)
     heatmap_color = cv2.applyColorMap(heatmap_8bit, cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    alpha_mask = np.expand_dims(cam ** 1.5, axis=2) * 0.65 
+    # Professional transparency blending
+    alpha_mask = np.expand_dims(cam ** 1.2, axis=2) * 0.7 
     overlay = (heatmap_color * alpha_mask) + (orig_img_array * (1 - alpha_mask))
     overlay = np.uint8(overlay)
 
-    with col3:
-        st.image(overlay, caption='3. Forced Target Grad-CAM', use_container_width=True)
+    with col2:
+        st.image(overlay, caption='Dense Tissue Activation Map', use_container_width=True)
 
-    # --- 8. DISPLAY RESULTS ---
+    # --- 7. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
@@ -184,4 +161,4 @@ if uploaded_file is not None and model_loaded:
         st.write(f"**Confidence:** {confidence:.2f}%")
         st.progress(int((1 - prob) * 100))
         
-    st.caption("Disclaimer: This is an educational AI tool. The preprocessing pipeline automatically isolates tissue to prevent Clever Hans dataset bias.")
+    st.caption("Disclaimer: This is an educational AI tool and not a substitute for professional medical advice.")
