@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -49,18 +50,26 @@ def load_model():
             fused_features = self.fusion_module(visual_features, radiomics)
             return self.classifier(fused_features)
 
-    device = torch.device("cpu") # Force CPU for cloud deployment stability
+    # Force CPU for stable cloud deployment
+    device = torch.device("cpu") 
     model = HybridBreastCancerModel(radiomic_feature_count=42).to(device)
-    model.load_state_dict(torch.load('adaptive_hybrid_breast_cancer_model.pth', map_location=device))
+    
+    # --- BULLETPROOF PATH FIX ---
+    # This forces Streamlit to look in the exact same folder as this app.py script
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
+    
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
     return model, device
 
-# Load model safely
+# Load model safely with error handling displayed on the web page
 try:
     model, device = load_model()
     model_loaded = True
 except Exception as e:
     st.error(f"Error loading model: {e}")
+    st.info("Please ensure 'adaptive_hybrid_breast_cancer_model.pth' is uploaded to the same GitHub folder as this app.py file.")
     model_loaded = False
 
 # --- 3. UI: IMAGE UPLOAD ---
@@ -71,20 +80,23 @@ if uploaded_file is not None and model_loaded:
     st.image(image, caption='Uploaded Scan', use_container_width=True)
     st.write("🔍 Analyzing image features...")
     
-    # --- 4. MAKE PREDICTION ---
+    # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     img_tensor = transform(image).unsqueeze(0).to(device)
+    
+    # Dummy radiomics tensor to satisfy the 42-feature requirement without pyradiomics
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
+    # --- 5. MAKE PREDICTION ---
     with torch.no_grad():
         output = model(img_tensor, dummy_radiomics)
         prob = torch.sigmoid(output).item()
         
-    # --- 5. DISPLAY RESULTS ---
+    # --- 6. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
