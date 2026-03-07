@@ -118,17 +118,20 @@ if uploaded_file is not None and model_loaded:
     else:
         (-output).backward() # Calculates gradients for Benign
     
-    # --- 7. GENERATE CLINICAL-GRADE HEATMAP ---
+    # --- 7. GENERATE TRUE CLINICAL GRAD-CAM ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
-    # Standard Grad-CAM math
+    # THE FIX: Raw gradients only. No np.abs()! 
+    # We only want features that push the prediction in the direction we asked for.
     weights = np.mean(grads, axis=(1, 2))
+    
     cam = np.zeros(activations.shape[1:], dtype=np.float32)
     for i, w in enumerate(weights):
         cam += w * activations[i, :, :]
         
-    cam = np.maximum(cam, 0) # The ReLU filter: Kills all negative signals instantly
+    # ReLU Filter: Erase everything that isn't actively contributing to our target class
+    cam = np.maximum(cam, 0) 
     
     # Normalize safely
     cam_min, cam_max = np.min(cam), np.max(cam)
@@ -137,29 +140,28 @@ if uploaded_file is not None and model_loaded:
     else:
         cam = np.zeros_like(cam)
 
-    # Stretch to match original image using smooth Cubic Interpolation
+    # Stretch smoothly to original image resolution
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
-    # THE NOISE FILTER: Erase all low-level background heat completely
-    cam[cam < 0.3] = 0.0  
+    # A gentle noise filter (reduced from 0.3 to 0.2 to not accidentally erase faint tumors)
+    cam[cam < 0.2] = 0.0  
     
     handle_fw.remove()
     handle_bw.remove()
     
-    # Apply colormap
+    # Create overlay
     orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # EXPONENTIAL ALPHA MASK: Makes the core bright red, and completely hides the edges
+    # Apply dynamic transparency mask
     alpha_mask = np.expand_dims(cam ** 1.5, axis=2) * 0.65 
-    
     overlay = (heatmap * alpha_mask) + (orig_img_array * (1 - alpha_mask))
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='Focused Grad-CAM Attention Map', use_container_width=True)
+        st.image(overlay, caption='True Grad-CAM Attention Map', use_container_width=True)
 
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
