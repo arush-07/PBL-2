@@ -6,11 +6,11 @@ import torchvision.models as models
 from torchvision import transforms
 from PIL import Image
 import numpy as np
-import cv2
 
 # --- 1. SET UP THE PAGE ---
-st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="wide")
-st.title("🩺 AI Breast Cancer Diagnosis with Localization")
+st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="centered")
+st.title("🩺 AI Breast Cancer Diagnosis")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction.")
 
 # --- 2. DEFINE THE AI ARCHITECTURE ---
 @st.cache_resource 
@@ -55,7 +55,6 @@ def load_model():
     model = HybridBreastCancerModel(radiomic_feature_count=42).to(device)
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Ensure this file exists in the same directory as this script
     MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
     
     if os.path.exists(MODEL_PATH):
@@ -72,16 +71,15 @@ except Exception as e:
     model_loaded = False
 
 # --- 3. UI: IMAGE UPLOAD ---
-uploaded_file = st.file_uploader("Upload a mammogram or ultrasound image...", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Choose a medical image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None and model_loaded:
-    # Use three columns: Left scan, Right Grad-CAM, Far Right Results
-    col1, col2, col3 = st.columns([2.5, 2.5, 1.5], gap="large")
-    
     image = Image.open(uploaded_file).convert('RGB')
-    orig_img_array = np.array(image)
     
-    # --- 4. PREPARE IMAGE ---
+    # Display the original scan centered
+    st.image(image, caption='Original Scan', use_container_width=True)
+    
+    # --- 4. PREPARE IMAGE & PREDICT ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -89,113 +87,20 @@ if uploaded_file is not None and model_loaded:
     ])
     
     img_tensor = transform(image).unsqueeze(0).to(device)
-    # Enable gradients specifically for Grad-CAM visualization
-    img_tensor.requires_grad = True 
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. CALCULATE GRAD-CAM (Visualizing features of the malignant class) ---
-    model.zero_grad()
-    
-    x = img_tensor
-    for i in range(8): # Loop through ResNet's sequential blocks
-        x = model.deep_extractor[i](x)
-    
-    features = x
-    features.retain_grad()
-    
-    x = model.deep_extractor[8](x) # The final AvgPool layer
-    flattened = torch.flatten(x, 1)
-    fused = model.fusion_module(flattened, dummy_radiomics)
-    output = model.classifier(fused)
-    
-    prob = torch.sigmoid(output).item()
-    
-    # Calculate gradients with respect to the output score
-    output.backward() 
-    
-    grads = features.grad[0]
-    acts = features.detach()[0]
-    weights = torch.mean(grads, dim=(1, 2), keepdim=True)
-    cam = torch.sum(weights * acts, dim=0).cpu().numpy()
-    
-    # Apply ReLU to retain only positive contributions to the decision
-    cam = np.maximum(cam, 0) 
-    # Normalize between 0 and 1
-    cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
-    
-    # --- 6. STABILIZED LOCALIZATION & CIRCLE MASK ---
-    # Resize the raw CAM to image dimensions
-    cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
-    
-    # STEP 1: Smooth the map to remove "jittery" random peaks
-    # A large kernel (1/10th of image width) helps find the true center of a mass
-    blur_size = int(image.width / 10) | 1 # Ensure it's odd
-    cam_smoothed = cv2.GaussianBlur(cam_resized, (blur_size, blur_size), 0)
-    
-    # STEP 2: Mask out the background (ignore heat in pure black areas)
-    gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray, 10, 1, cv2.THRESH_BINARY)
-    cam_smoothed = cam_smoothed * tissue_mask
+    with torch.no_grad():
+        output = model(img_tensor, dummy_radiomics)
+        prob = torch.sigmoid(output).item()
 
-    # STEP 3: Find the single most suspicious coordinate (Global Maxima)
-    # This prevents the circle from jumping between two different areas
-    _, max_val, _, max_loc = cv2.minMaxLoc(cam_smoothed)
+    # --- 5. RESULTS ---
+    st.markdown("---")
+    confidence = max(prob, 1 - prob) * 100
     
-    detection_viz_left = orig_img_array.copy()
-    detection_viz_right = orig_img_array.copy()
-    
-    # Define clinical marker (White circle)
-    circle_color = (255, 255, 255) 
-    circle_thickness = 3
-    # Scale radius based on image size (e.g., 8% of the width)
-    radius = int(image.width * 0.08) 
-
-    # Only draw if the AI actually detected something (max_val > threshold)
-    if max_val > 0.2: 
-        cv2.circle(detection_viz_left, max_loc, radius, circle_color, circle_thickness)
-        cv2.circle(detection_viz_right, max_loc, radius, circle_color, circle_thickness)
+    if prob >= 0.5:
+        st.error(f"### ⚠️ Diagnosis: Malignant")
     else:
-        st.warning("Low activation: AI did not find a high-confidence focal point.")
-
-    # --- 7. RENDER OVERLAY ---
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_smoothed), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    
-    # Blend heatmap only where heat exists
-    alpha = np.expand_dims(cam_smoothed, axis=2) * 0.6
-    overlay = (detection_viz_right * (1 - alpha) + heatmap * alpha).astype(np.uint8)
-    # --- 7. TISSUE-FOCUSED GRAD-CAM MAP ---
-    gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
-    kernel = np.ones((5,5), np.uint8)
-    tissue_mask = cv2.morphologyEx(tissue_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
-    cam_final = cam_resized * tissue_mask
-    
-    # --- 8. RENDER OVERLAY (Using the image that already has the circle drawn) ---
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_final), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    
-    # Apply alpha blending: Only visible activation regions blend the heatmap
-    alpha = np.expand_dims(cam_final, axis=2) * 0.5
-    overlay = (detection_viz_right * (1 - alpha) + heatmap * alpha).astype(np.uint8)
-
-    # --- 9. UI: DISPLAY IMAGES ---
-    with col1:
-        st.image(detection_viz_left, caption='Original Scan', width=500)
-    with col2:
-        st.image(overlay, caption='Focused Grad-CAM Map', width=500)
-
-    # --- 10. RESULTS (In the far right column) ---
-    with col3:
-        st.subheader("Analysis Results")
-        confidence = max(prob, 1 - prob) * 100
+        st.success(f"### ✅ Diagnosis: Benign")
         
-        if prob >= 0.5:
-            st.error("### ⚠️ Malignant")
-        else:
-            st.success("### ✅ Benign")
-            
-        st.write(f"**AI Confidence:** {confidence:.2f}%")
-        st.progress(int(confidence))
-        
-        st.info("Note: The white circle indicates the focus area driving the Malignant classification. This is an AI tool and must be verified by a professional.")
+    st.write(f"**Confidence:** {confidence:.2f}%")
+    st.progress(int(confidence))
