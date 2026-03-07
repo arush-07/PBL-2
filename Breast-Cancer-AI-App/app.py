@@ -58,7 +58,6 @@ def load_model():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
     
-    # Load weights if they exist
     if os.path.exists(MODEL_PATH):
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     
@@ -91,55 +90,54 @@ if uploaded_file is not None and model_loaded:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     img_tensor = transform(image).unsqueeze(0).to(device)
-    img_tensor.requires_grad = True # Required for Grad-CAM
+    img_tensor.requires_grad = True 
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
     # --- 5. CALCULATE GRAD-CAM ---
     model.zero_grad()
     
-    # Pass through model manually to catch the final convolutional layer
     x = img_tensor
-    for i in range(8): # Up to layer 4 of ResNet
+    for i in range(8): 
         x = model.deep_extractor[i](x)
     
     features = x
     features.retain_grad()
     
-    # Finish forward pass
-    x = model.deep_extractor[8](x) # AvgPool
+    x = model.deep_extractor[8](x) 
     flattened = torch.flatten(x, 1)
     fused = model.fusion_module(flattened, dummy_radiomics)
     output = model.classifier(fused)
     
     prob = torch.sigmoid(output).item()
-    output.backward() # Backpropagate
+    output.backward() 
     
-    # Generate Heatmap
     grads = features.grad[0]
     acts = features.detach()[0]
     weights = torch.mean(grads, dim=(1, 2), keepdim=True)
     cam = torch.sum(weights * acts, dim=0).cpu().numpy()
-    cam = np.maximum(cam, 0) # ReLU
+    cam = np.maximum(cam, 0) 
     
-    # Normalize
     cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
     
-    # --- 6. APPLY BACKGROUND MASKING ---
+    # --- 6. APPLY TISSUE MASKING ---
     orig_img_array = np.array(image)
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
-    # THE FIX: Create a mask of the tissue (anything not black)
+    # Use the brightness of the scan to create a tissue mask
     gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
+    _, tissue_mask = cv2.threshold(gray, 20, 1, cv2.THRESH_BINARY)
     
-    # Apply the mask to the heatmap to erase corner bleed
+    # Clean up the mask to remove small text labels
+    kernel = np.ones((5,5), np.uint8)
+    tissue_mask = cv2.morphologyEx(tissue_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    
+    # Apply the mask to the heatmap to erase corner and text bleed
     cam_masked = cam_resized * tissue_mask
     
     # --- 7. RENDER OVERLAY ---
     heatmap = cv2.applyColorMap(np.uint8(255 * cam_masked), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Blend: Only show heat where cam_masked > 0
     alpha = np.expand_dims(cam_masked, axis=2) * 0.5
     overlay = (orig_img_array * (1 - alpha) + heatmap * alpha).astype(np.uint8)
 
