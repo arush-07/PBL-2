@@ -118,7 +118,7 @@ if uploaded_file is not None and model_loaded:
     else:
         (-output).backward() # Calculates gradients for Benign
     
-    # --- 7. GENERATE HEATMAP ---
+    # --- 7. GENERATE HIGH-RES HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
@@ -128,7 +128,10 @@ if uploaded_file is not None and model_loaded:
         cam += w * activations[i, :, :]
         
     cam = np.maximum(cam, 0)
-    cam = cv2.resize(cam, (224, 224))
+    
+    # THE FIX: Get original image dimensions and stretch the CAM to fit it perfectly
+    orig_width, orig_height = image.size
+    cam = cv2.resize(cam, (orig_width, orig_height))
     
     # Normalize safely
     cam_min, cam_max = np.min(cam), np.max(cam)
@@ -140,16 +143,18 @@ if uploaded_file is not None and model_loaded:
     handle_fw.remove()
     handle_bw.remove()
     
-    # Create overlay
-    img_resized = np.array(image.resize((224, 224)))
+    # Create overlay using the ORIGINAL high-resolution image array
+    orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    overlay = heatmap * 0.4 + img_resized * 0.6
+    
+    # Blend them together
+    overlay = heatmap * 0.4 + orig_img_array * 0.6
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
-
+        st.image(overlay, caption='High-Res Grad-CAM Attention Map', use_container_width=True)
+        
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
