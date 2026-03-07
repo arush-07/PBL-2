@@ -114,7 +114,7 @@ if uploaded_file is not None and model_loaded:
     
     # Ask the model what features correlate with its specific decision
     if prob >= 0.5:
-        output.backward() # Calculates gradients for Malignant
+        output.backward() # Calculates gradients for Malignan
     else:
         (-output).backward() # Calculates gradients for Benign
     
