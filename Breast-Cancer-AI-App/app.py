@@ -11,7 +11,7 @@ import cv2
 # --- 1. SET UP THE PAGE ---
 st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Tissue Activation Map.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM Map.")
 
 # --- 2. DEFINE THE ADVANCED AI ARCHITECTURE ---
 @st.cache_resource 
@@ -80,7 +80,7 @@ if uploaded_file is not None and model_loaded:
     with col1:
         st.image(image, caption='Original Scan', use_container_width=True)
     
-    st.write("🔍 Analyzing image features and generating Activation Map...")
+    st.write("🔍 Analyzing image features and generating Grad-CAM...")
     
     # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
@@ -92,60 +92,72 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. HOOK INTO LAYER 4 FOR SPATIAL DATA ---
-    feature_blobs = []
-    def hook_feature(module, input, output):
-        # Grab the output of layer4 (which is a 7x7 spatial map!)
-        feature_blobs.append(output.cpu().data.numpy())
-        
-    # Target layer 4 of ResNet50
-    target_layer = model.deep_extractor[7] 
-    handle = target_layer.register_forward_hook(hook_feature)
+    # --- 5. THE FOOLPROOF, HOOK-LESS GRAD-CAM ---
+    model.zero_grad()
     
-    # --- 6. FORWARD PASS ---
-    with torch.no_grad():
-        output = model(img_tensor, dummy_radiomics)
-        prob = torch.sigmoid(output).item()
-        
-    handle.remove() # Clean up the hook
-        
-    # --- 7. TISSUE ACTIVATION MAP ---
-    # Extract the spatial activations (Shape: [1, 2048, 7, 7]) -> [2048, 7, 7]
-    activations = feature_blobs[0][0]
+    # Step A: Manually step through the network up to Layer 4
+    x = img_tensor
+    for i in range(8): # Passes through deep_extractor indices 0 to 7
+        x = model.deep_extractor[i](x)
     
-    # Take the mean across all 2048 filters to see overall model attention
-    cam = np.mean(activations, axis=0)
+    layer4_features = x # Shape: [1, 2048, 7, 7]
+    layer4_features.retain_grad() # Crucial: Tell PyTorch to save these specific gradients
     
-    # Normalize strictly between 0 and 1
+    # Step B: Finish the forward pass
+    x = model.deep_extractor[8](layer4_features) # AdaptiveAvgPool2d
+    flattened_features = torch.flatten(x, 1)
+    fused_features = model.fusion_module(flattened_features, dummy_radiomics)
+    output = model.classifier(fused_features)
+    
+    prob = torch.sigmoid(output).item()
+    
+    # Step C: Backward Pass to get importance weights
+    if prob >= 0.5:
+        output.backward() # What made this Malignant?
+    else:
+        (-output).backward() # What made this Benign?
+        
+    # Step D: Extract gradients and activations
+    grads = layer4_features.grad # [1, 2048, 7, 7]
+    activations = layer4_features.detach() # [1, 2048, 7, 7]
+    
+    # Calculate weights (mean of gradients across spatial dimensions)
+    weights = torch.mean(grads, dim=(2, 3), keepdim=True) 
+    
+    # Multiply activations by weights and sum across channels
+    cam = torch.sum(weights * activations, dim=1).squeeze(0).cpu().numpy()
+    
+    # ReLU to keep only positive influences
     cam = np.maximum(cam, 0)
+    
+    # Normalize
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
     else:
         cam = np.zeros_like(cam)
 
-    # Resize the 7x7 grid to original image size using smooth interpolation
+    # --- 6. OVERLAY GENERATION ---
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
-    # Add a subtle noise filter so the background doesn't glow blue/green
-    cam[cam < 0.25] = 0.0
-
-    # --- 8. CREATE THE OVERLAY ---
-    orig_img_array = np.array(image)
+    # Clean up low-level noise
+    cam[cam < 0.2] = 0.0  
     
-    # Convert the normalized CAM to a heatmap colorspace
+    orig_img_array = np.array(image)
     heatmap_8bit = np.uint8(255 * cam)
     heatmap_color = cv2.applyColorMap(heatmap_8bit, cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Standard blending: 60% original image, 40% heatmap
-    overlay = cv2.addWeighted(orig_img_array, 0.6, heatmap_color, 0.4, 0)
+    # Professional dynamic transparency blending
+    alpha_mask = np.expand_dims(cam ** 1.5, axis=2) * 0.65 
+    overlay = (heatmap_color * alpha_mask) + (orig_img_array * (1 - alpha_mask))
+    overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='ResNet50 Spatial Activation Map', use_container_width=True)
+        st.image(overlay, caption='True Target Grad-CAM', use_container_width=True)
 
-    # --- 9. DISPLAY RESULTS ---
+    # --- 7. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
