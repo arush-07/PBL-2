@@ -107,33 +107,32 @@ if uploaded_file is not None and model_loaded:
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. MAKE PREDICTION & REVERSE POLARITY ---
+    # --- 6. MAKE PREDICTION ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    # The Fix: Ask the model what features correlate with its specific decision
-    if prob >= 0.5:
-        output.backward() # Calculates gradients for Malignant
-    else:
-        (-output).backward() # Calculates gradients for Benign
+    # Just do a standard backward pass
+    output.backward()
     
     # --- 7. GENERATE HIGH-RES HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
-    weights = np.mean(grads, axis=(1, 2))
+    # THE FIX 1: Absolute gradients. Show us what is important, regardless of direction!
+    weights = np.mean(np.abs(grads), axis=(1, 2))
+    
     cam = np.zeros(activations.shape[1:], dtype=np.float32)
     for i, w in enumerate(weights):
         cam += w * activations[i, :, :]
         
-    cam = np.maximum(cam, 0)
+    cam = np.maximum(cam, 0) # Apply ReLU
     
-    # THE FIX: Get original image dimensions and stretch the CAM to fit it perfectly
+    # Stretch to match the original massive mammogram resolution
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height))
     
-    # Normalize safely
+    # Normalize safely between 0 and 1
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
@@ -143,18 +142,20 @@ if uploaded_file is not None and model_loaded:
     handle_fw.remove()
     handle_bw.remove()
     
-    # Create overlay using the ORIGINAL high-resolution image array
+    # THE FIX 2: Dynamic Opacity Blending
     orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Blend them together
-    overlay = heatmap * 0.4 + orig_img_array * 0.6
+    # Use the CAM itself to decide what is transparent!
+    # Multiply by 0.7 so the red never completely blocks out the tissue underneath
+    cam_3d = np.expand_dims(cam, axis=2) * 0.7 
+    overlay = (heatmap * cam_3d) + (orig_img_array * (1 - cam_3d))
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='High-Res Grad-CAM Attention Map', use_container_width=True)
-        
+        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
+
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
