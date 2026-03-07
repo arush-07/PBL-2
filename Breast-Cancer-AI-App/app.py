@@ -11,9 +11,9 @@ import cv2
 # --- 1. SET UP THE PAGE ---
 st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and classic Grad-CAM Map.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM visualization.")
 
-# --- 2. DEFINE THE AI ARCHITECTURE ---
+# --- 2. DEFINE THE ORIGINAL ARCHITECTURE ---
 @st.cache_resource 
 def load_model():
     class AttentionFusion(nn.Module):
@@ -61,7 +61,7 @@ def load_model():
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     except Exception:
-        pass # Handle missing model gracefully in UI
+        pass # Streamlit handles the error below
         
     model.eval()
     return model, device
@@ -71,13 +71,14 @@ try:
     model_loaded = True
 except Exception as e:
     st.error(f"Error loading model: {e}")
+    st.info("Ensure 'adaptive_hybrid_breast_cancer_model.pth' is uploaded to the same folder.")
     model_loaded = False
 
 # --- 3. UI: IMAGE UPLOAD ---
 uploaded_file = st.file_uploader("Choose a medical image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None and model_loaded:
-    col1, col2 = st.columns(2, gap="large")
+    col1, col2 = st.columns(2)
     
     image = Image.open(uploaded_file).convert('RGB')
     with col1:
@@ -91,65 +92,71 @@ if uploaded_file is not None and model_loaded:
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    img_tensor = transform(image).unsqueeze(0).to(device)
+    
+    # Enable gradients on the input image
+    img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. PURE STANDARD GRAD-CAM ---
+    # --- 5. ORIGINAL GRAD-CAM HOOKS ---
+    feature_blobs = []
+    backward_blobs = []
+
+    def forward_hook(module, input, output):
+        feature_blobs.append(output)
+
+    def backward_hook(module, grad_input, grad_output):
+        backward_blobs.append(grad_output[0])
+
+    target_layer = model.deep_extractor[7]
+    handle_fw = target_layer.register_forward_hook(forward_hook)
+    handle_bw = target_layer.register_full_backward_hook(backward_hook)
+    
+    # --- 6. DEBUGGED PREDICTION AND GRADIENTS ---
     model.zero_grad()
-    
-    x = img_tensor
-    for i in range(8): 
-        x = model.deep_extractor[i](x)
-    
-    features = x 
-    features.retain_grad() 
-    
-    x = model.deep_extractor[8](features)
-    flattened = torch.flatten(x, 1)
-    fused = model.fusion_module(flattened, dummy_radiomics)
-    output = model.classifier(fused)
-    
+    output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    if prob >= 0.5:
-        output.backward() 
+    # DEBUG FIX: Always backpropagate the actual output. No if/else polarity flips.
+    output.backward() 
+    
+    # --- 7. DEBUGGED HEATMAP GENERATION ---
+    activations = feature_blobs[0][0].cpu().detach().numpy()
+    grads = backward_blobs[0][0].cpu().detach().numpy()
+    
+    weights = np.mean(grads, axis=(1, 2))
+    cam = np.zeros(activations.shape[1:], dtype=np.float32)
+    for i, w in enumerate(weights):
+        cam += w * activations[i, :, :]
+        
+    cam = np.maximum(cam, 0) # Keep positive signals
+    
+    # DEBUG FIX: Resize accurately to original dimensions
+    orig_width, orig_height = image.size
+    cam = cv2.resize(cam, (orig_width, orig_height))
+    
+    # Normalize
+    cam_min, cam_max = np.min(cam), np.max(cam)
+    if cam_max > cam_min:
+        cam = (cam - cam_min) / (cam_max - cam_min)
     else:
-        (-output).backward() 
+        cam = np.zeros_like(cam)
     
-    grads = features.grad[0] 
-    acts = features.detach()[0] 
+    handle_fw.remove()
+    handle_bw.remove()
     
-    weights = grads.mean(dim=[1, 2], keepdim=True)
-    cam = (weights * acts).sum(dim=0).cpu().numpy()
-    
-    cam = np.maximum(cam, 0)
-    
-    cam_max = np.max(cam)
-    if cam_max > 0:
-        cam = cam / cam_max
-
-    # --- 6. SIMPLE, CLEAN OVERLAY WITH BACKGROUND MASK ---
+    # DEBUG FIX: Dynamic Alpha Blending to remove the blue background
     orig_img_array = np.array(image)
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # THE MASK FIX: Find the pitch-black background
-    gray_orig = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray_orig, 10, 255, cv2.THRESH_BINARY)
-    
-    cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
-    
-    # Force the heatmap to 0 wherever the original image is black
-    cam_resized[tissue_mask == 0] = 0
-    
-    heatmap_color = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
-    
-    alpha = cam_resized[..., np.newaxis] * 0.6 
-    overlay = (orig_img_array * (1 - alpha) + heatmap_color * alpha).astype(np.uint8)
+    # Tying transparency to the heat itself
+    alpha = np.expand_dims(cam, axis=2) * 0.5 
+    overlay = (heatmap * alpha + orig_img_array * (1 - alpha)).astype(np.uint8)
 
     with col2:
-        st.image(overlay, caption='Classic Grad-CAM', use_container_width=True)
+        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
 
-    # --- 7. DISPLAY RESULTS ---
+    # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
