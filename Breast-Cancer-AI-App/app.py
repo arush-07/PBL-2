@@ -37,7 +37,6 @@ def load_model():
         def __init__(self, radiomic_feature_count=42): 
             super(HybridBreastCancerModel, self).__init__()
             resnet = models.resnet50(weights=None)
-            # layer4 is at index 7. We need to hook into this for Grad-CAM.
             self.deep_extractor = nn.Sequential(*list(resnet.children())[:-1])
             self.fusion_module = AttentionFusion(radiomic_feature_count)
             self.classifier = nn.Sequential(
@@ -89,7 +88,8 @@ if uploaded_file is not None and model_loaded:
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    img_tensor = transform(image).unsqueeze(0).to(device)
+    # IMPORTANT: Enable gradients on the input image for CAM calculation
+    img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
     # --- 5. GRAD-CAM HOOKS ---
@@ -102,24 +102,26 @@ if uploaded_file is not None and model_loaded:
     def backward_hook(module, grad_input, grad_output):
         backward_blobs.append(grad_output[0])
 
-    # Hook into Layer 4 of ResNet50 (index 7 in our Sequential extractor)
     target_layer = model.deep_extractor[7]
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. MAKE PREDICTION ---
+    # --- 6. MAKE PREDICTION & BACKWARD PASS ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    # Trigger backward pass for gradients
-    output.backward()
+    # THE FIX: Gradient Polarity Reversal
+    # If the model thinks it's Benign, we must flip the sign to highlight Benign features!
+    if prob >= 0.5:
+        output.backward() # What makes it Malignant?
+    else:
+        (-output).backward() # What makes it Benign?
     
     # --- 7. GENERATE HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
-    # Pool gradients and apply to activations
     weights = np.mean(grads, axis=(1, 2))
     cam = np.zeros(activations.shape[1:], dtype=np.float32)
     for i, w in enumerate(weights):
@@ -127,10 +129,14 @@ if uploaded_file is not None and model_loaded:
         
     cam = np.maximum(cam, 0)
     cam = cv2.resize(cam, (224, 224))
-    cam = cam - np.min(cam)
-    cam = cam / (np.max(cam) + 1e-8) # Add epsilon to prevent division by zero
     
-    # Cleanup hooks
+    # Normalize safely
+    cam_min, cam_max = np.min(cam), np.max(cam)
+    if cam_max > cam_min:
+        cam = (cam - cam_min) / (cam_max - cam_min)
+    else:
+        cam = np.zeros_like(cam)
+    
     handle_fw.remove()
     handle_bw.remove()
     
