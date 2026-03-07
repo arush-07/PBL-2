@@ -107,54 +107,59 @@ if uploaded_file is not None and model_loaded:
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. MAKE PREDICTION ---
+   # --- 6. MAKE PREDICTION & POLARITY ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    # Just do a standard backward pass
-    output.backward()
+    # Ask the model what features correlate with its specific decision
+    if prob >= 0.5:
+        output.backward() # Calculates gradients for Malignant
+    else:
+        (-output).backward() # Calculates gradients for Benign
     
-    # --- 7. GENERATE HIGH-RES HEATMAP ---
+    # --- 7. GENERATE CLINICAL-GRADE HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
-    # THE FIX 1: Absolute gradients. Show us what is important, regardless of direction!
-    weights = np.mean(np.abs(grads), axis=(1, 2))
-    
+    # Standard Grad-CAM math
+    weights = np.mean(grads, axis=(1, 2))
     cam = np.zeros(activations.shape[1:], dtype=np.float32)
     for i, w in enumerate(weights):
         cam += w * activations[i, :, :]
         
-    cam = np.maximum(cam, 0) # Apply ReLU
+    cam = np.maximum(cam, 0) # The ReLU filter: Kills all negative signals instantly
     
-    # Stretch to match the original massive mammogram resolution
-    orig_width, orig_height = image.size
-    cam = cv2.resize(cam, (orig_width, orig_height))
-    
-    # Normalize safely between 0 and 1
+    # Normalize safely
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
     else:
         cam = np.zeros_like(cam)
+
+    # Stretch to match original image using smooth Cubic Interpolation
+    orig_width, orig_height = image.size
+    cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
+    
+    # THE NOISE FILTER: Erase all low-level background heat completely
+    cam[cam < 0.3] = 0.0  
     
     handle_fw.remove()
     handle_bw.remove()
     
-    # THE FIX 2: Dynamic Opacity Blending
+    # Apply colormap
     orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Use the CAM itself to decide what is transparent!
-    # Multiply by 0.7 so the red never completely blocks out the tissue underneath
-    cam_3d = np.expand_dims(cam, axis=2) * 0.7 
-    overlay = (heatmap * cam_3d) + (orig_img_array * (1 - cam_3d))
+    # EXPONENTIAL ALPHA MASK: Makes the core bright red, and completely hides the edges
+    alpha_mask = np.expand_dims(cam ** 1.5, axis=2) * 0.65 
+    
+    overlay = (heatmap * alpha_mask) + (orig_img_array * (1 - alpha_mask))
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
+        st.image(overlay, caption='Focused Grad-CAM Attention Map', use_container_width=True)
 
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
