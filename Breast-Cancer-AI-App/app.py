@@ -11,9 +11,9 @@ import cv2
 # --- 1. SET UP THE PAGE ---
 st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM visualization.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Focused Grad-CAM Map.")
 
-# --- 2. DEFINE THE ARCHITECTURE ---
+# --- 2. DEFINE THE AI ARCHITECTURE ---
 @st.cache_resource 
 def load_model():
     class AttentionFusion(nn.Module):
@@ -58,7 +58,10 @@ def load_model():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
     
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    # Load weights if they exist
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    
     model.eval()
     return model, device
 
@@ -79,6 +82,8 @@ if uploaded_file is not None and model_loaded:
     with col1:
         st.image(image, caption='Original Scan', use_container_width=True)
     
+    st.write("🔍 Analyzing image features and generating Focused Grad-CAM...")
+    
     # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -86,47 +91,71 @@ if uploaded_file is not None and model_loaded:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     img_tensor = transform(image).unsqueeze(0).to(device)
+    img_tensor.requires_grad = True # Required for Grad-CAM
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. STABLE ACTIVATION MAPPING ---
-    with torch.no_grad():
-        # Get raw activations from the final convolutional layer
-        x = img_tensor
-        for i in range(8): 
-            x = model.deep_extractor[i](x)
-        
-        # Calculate CAM by taking the maximum activation across all 2048 filters
-        cam = torch.max(x[0], dim=0)[0].cpu().numpy()
-        
-        # Final prediction
-        output = model(img_tensor, dummy_radiomics)
-        prob = torch.sigmoid(output).item()
-
-    # --- 6. RENDER HEATMAP ---
-    cam = np.maximum(cam, 0)
+    # --- 5. CALCULATE GRAD-CAM ---
+    model.zero_grad()
+    
+    # Pass through model manually to catch the final convolutional layer
+    x = img_tensor
+    for i in range(8): # Up to layer 4 of ResNet
+        x = model.deep_extractor[i](x)
+    
+    features = x
+    features.retain_grad()
+    
+    # Finish forward pass
+    x = model.deep_extractor[8](x) # AvgPool
+    flattened = torch.flatten(x, 1)
+    fused = model.fusion_module(flattened, dummy_radiomics)
+    output = model.classifier(fused)
+    
+    prob = torch.sigmoid(output).item()
+    output.backward() # Backpropagate
+    
+    # Generate Heatmap
+    grads = features.grad[0]
+    acts = features.detach()[0]
+    weights = torch.mean(grads, dim=(1, 2), keepdim=True)
+    cam = torch.sum(weights * acts, dim=0).cpu().numpy()
+    cam = np.maximum(cam, 0) # ReLU
+    
+    # Normalize
     cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
     
-    # Resize and Blend
+    # --- 6. APPLY BACKGROUND MASKING ---
+    orig_img_array = np.array(image)
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+    
+    # THE FIX: Create a mask of the tissue (anything not black)
+    gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
+    _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
+    
+    # Apply the mask to the heatmap to erase corner bleed
+    cam_masked = cam_resized * tissue_mask
+    
+    # --- 7. RENDER OVERLAY ---
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_masked), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Simple, balanced overlay
-    orig_img = np.array(image)
-    overlay = cv2.addWeighted(orig_img, 0.6, heatmap, 0.4, 0)
+    # Blend: Only show heat where cam_masked > 0
+    alpha = np.expand_dims(cam_masked, axis=2) * 0.5
+    overlay = (orig_img_array * (1 - alpha) + heatmap * alpha).astype(np.uint8)
 
     with col2:
-        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
+        st.image(overlay, caption='Focused Grad-CAM Map', use_container_width=True)
 
-    # --- 7. DISPLAY RESULTS ---
+    # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
+    label = "Malignant" if prob >= 0.5 else "Benign"
     
     if prob >= 0.5:
-        st.error(f"### ⚠️ Diagnosis: Malignant (Confidence: {confidence:.2f}%)")
-        st.progress(int(prob * 100))
+        st.error(f"### ⚠️ Diagnosis: {label}")
     else:
-        st.success(f"### ✅ Diagnosis: Benign (Confidence: {confidence:.2f}%)")
-        st.progress(int((1 - prob) * 100))
+        st.success(f"### ✅ Diagnosis: {label}")
         
+    st.write(f"**Confidence:** {confidence:.2f}%")
+    st.progress(int(confidence))
     st.caption("Disclaimer: This is an educational AI tool and not a substitute for professional medical advice.")
