@@ -90,15 +90,15 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. CLASSIC GRAD-CAM ALGORITHM ---
+    # --- 5. PURE STANDARD GRAD-CAM ---
     model.zero_grad()
     
-    # Forward pass manually to layer 4 (index 7)
+    # Forward pass manually to Layer 4 (the final spatial grid)
     x = img_tensor
     for i in range(8): 
         x = model.deep_extractor[i](x)
     
-    features = x # Shape: [1, 2048, 7, 7]
+    features = x 
     features.retain_grad()
     
     # Finish the forward pass
@@ -109,14 +109,15 @@ if uploaded_file is not None and model_loaded:
     
     prob = torch.sigmoid(output).item()
     
-    # Standard backward pass
+    # THE FIX: ALWAYS calculate gradients for the Malignant class. 
+    # No polarity flipping. Just straight math.
     output.backward()
     
     # Extract gradients and activations
-    grads = features.grad[0] # [2048, 7, 7]
-    acts = features.detach()[0] # [2048, 7, 7]
+    grads = features.grad[0] 
+    acts = features.detach()[0] 
     
-    # Classic Grad-CAM Math
+    # Standard Grad-CAM math
     weights = grads.mean(dim=[1, 2], keepdim=True)
     cam = (weights * acts).sum(dim=0).cpu().numpy()
     
@@ -133,16 +134,14 @@ if uploaded_file is not None and model_loaded:
     # --- 6. SIMPLE, CLEAN OVERLAY ---
     orig_img_array = np.array(image)
     
-    # Resize the heatmap to match the original image size exactly
-    cam_resized = cv2.resize(cam, (image.width, image.height))
+    # Resize the heatmap to match the original image size smoothly
+    cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
-    # Create the colors
+    # Apply colormap
     heatmap_color = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Simple Alpha Blending:
-    # Where cam is 0 (cold), it is 100% transparent.
-    # Where cam is 1 (hot), it is 50% transparent so you can still see the tissue underneath.
+    # Simple Alpha Blending: Where the CAM is cold (0), keep it perfectly transparent
     alpha = cam_resized[..., np.newaxis] * 0.5 
     overlay = (orig_img_array * (1 - alpha) + heatmap_color * alpha).astype(np.uint8)
 
