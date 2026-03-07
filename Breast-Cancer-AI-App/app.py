@@ -123,41 +123,47 @@ if uploaded_file is not None and model_loaded:
     # Normalize between 0 and 1
     cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
     
-    # --- 6. PROCESS IMAGE & CREATE CIRCLE MASK ---
+    # --- 6. STABILIZED LOCALIZATION & CIRCLE MASK ---
+    # Resize the raw CAM to image dimensions
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
-    # We create a binary mask from the normalized activation map to isolate the "tumor" region
-    _, circle_mask = cv2.threshold(cam_resized, 0.5, 1, cv2.THRESH_BINARY)
-    circle_mask = np.uint8(circle_mask * 255)
+    # STEP 1: Smooth the map to remove "jittery" random peaks
+    # A large kernel (1/10th of image width) helps find the true center of a mass
+    blur_size = int(image.width / 10) | 1 # Ensure it's odd
+    cam_smoothed = cv2.GaussianBlur(cam_resized, (blur_size, blur_size), 0)
     
-    # Find contours within this high-activation mask to determine the circle's parameters
-    contours, _ = cv2.findContours(circle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # STEP 2: Mask out the background (ignore heat in pure black areas)
+    gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
+    _, tissue_mask = cv2.threshold(gray, 10, 1, cv2.THRESH_BINARY)
+    cam_smoothed = cam_smoothed * tissue_mask
+
+    # STEP 3: Find the single most suspicious coordinate (Global Maxima)
+    # This prevents the circle from jumping between two different areas
+    _, max_val, _, max_loc = cv2.minMaxLoc(cam_smoothed)
     
     detection_viz_left = orig_img_array.copy()
     detection_viz_right = orig_img_array.copy()
     
-    # Define circle color and thickness (White, matching reference)
+    # Define clinical marker (White circle)
     circle_color = (255, 255, 255) 
-    circle_thickness = 4
+    circle_thickness = 3
+    # Scale radius based on image size (e.g., 8% of the width)
+    radius = int(image.width * 0.08) 
 
-    if contours:
-        # Get the largest activation region
-        c = max(contours, key=cv2.contourArea)
-        # Find the center and radius of the minimum enclosing circle
-        (x, y), radius = cv2.minEnclosingCircle(c)
-        center = (int(x), int(y))
-        
-        # Enforce a small size relative to the scan if needed, or stick strictly to Grad-CAM area.
-        # Here we use the calculated radius, similar to the reference image size.
-        radius = int(radius * 0.9) # Slightly smaller than the max area, similar to reference look.
-        
-        # Draw the circle on the Left Image visualization
-        cv2.circle(detection_viz_left, center, radius, circle_color, circle_thickness)
-        # Draw the circle on the Right Image visualization (before heatmap is overlayed)
-        cv2.circle(detection_viz_right, center, radius, circle_color, circle_thickness)
+    # Only draw if the AI actually detected something (max_val > threshold)
+    if max_val > 0.2: 
+        cv2.circle(detection_viz_left, max_loc, radius, circle_color, circle_thickness)
+        cv2.circle(detection_viz_right, max_loc, radius, circle_color, circle_thickness)
     else:
-        st.warning("Could not clearly localize a focused activation region for circle annotation.")
+        st.warning("Low activation: AI did not find a high-confidence focal point.")
 
+    # --- 7. RENDER OVERLAY ---
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_smoothed), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    
+    # Blend heatmap only where heat exists
+    alpha = np.expand_dims(cam_smoothed, axis=2) * 0.6
+    overlay = (detection_viz_right * (1 - alpha) + heatmap * alpha).astype(np.uint8)
     # --- 7. TISSUE-FOCUSED GRAD-CAM MAP ---
     gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
     _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
