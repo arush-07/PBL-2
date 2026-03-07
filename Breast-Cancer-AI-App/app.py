@@ -9,7 +9,7 @@ import numpy as np
 import cv2
 
 # --- 1. SET UP THE PAGE ---
-st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
 st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Focused Grad-CAM Map.")
 
@@ -81,8 +81,6 @@ if uploaded_file is not None and model_loaded:
     with col1:
         st.image(image, caption='Original Scan', use_container_width=True)
     
-    st.write("🔍 Analyzing image features and generating Focused Grad-CAM...")
-    
     # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -109,6 +107,8 @@ if uploaded_file is not None and model_loaded:
     output = model.classifier(fused)
     
     prob = torch.sigmoid(output).item()
+    
+    # Always target the malignant class for visualization
     output.backward() 
     
     grads = features.grad[0]
@@ -119,41 +119,38 @@ if uploaded_file is not None and model_loaded:
     
     cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
     
-    # --- 6. APPLY TISSUE MASKING ---
+    # --- 6. APPLY SPATIAL MASKING FIX ---
     orig_img_array = np.array(image)
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
-    # Use the brightness of the scan to create a tissue mask
+    # THE FIX: Create a mask of the tissue (anything not pitch black)
     gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray, 20, 1, cv2.THRESH_BINARY)
+    _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
     
-    # Clean up the mask to remove small text labels
+    # Clean the mask to ignore small artifacts like text
     kernel = np.ones((5,5), np.uint8)
     tissue_mask = cv2.morphologyEx(tissue_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
     
-    # Apply the mask to the heatmap to erase corner and text bleed
-    cam_masked = cam_resized * tissue_mask
+    # Erase any heat outside the tissue mask
+    cam_final = cam_resized * tissue_mask
     
     # --- 7. RENDER OVERLAY ---
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_masked), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_final), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    alpha = np.expand_dims(cam_masked, axis=2) * 0.5
+    alpha = np.expand_dims(cam_final, axis=2) * 0.5
     overlay = (orig_img_array * (1 - alpha) + heatmap * alpha).astype(np.uint8)
 
     with col2:
         st.image(overlay, caption='Focused Grad-CAM Map', use_container_width=True)
 
-    # --- 8. DISPLAY RESULTS ---
+    # --- 8. RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
-    label = "Malignant" if prob >= 0.5 else "Benign"
-    
     if prob >= 0.5:
-        st.error(f"### ⚠️ Diagnosis: {label}")
+        st.error(f"### ⚠️ Diagnosis: Malignant")
     else:
-        st.success(f"### ✅ Diagnosis: {label}")
+        st.success(f"### ✅ Diagnosis: Benign")
         
     st.write(f"**Confidence:** {confidence:.2f}%")
     st.progress(int(confidence))
-    st.caption("Disclaimer: This is an educational AI tool and not a substitute for professional medical advice.")
