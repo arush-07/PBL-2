@@ -90,16 +90,16 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. PURE STANDARD GRAD-CAM ---
+    # --- 5. PURE STANDARD GRAD-CAM WITH POLARITY FIX ---
     model.zero_grad()
     
-    # Forward pass manually to Layer 4 (the final spatial grid)
+    # Forward pass manually up to Layer 4 (the final 7x7 spatial grid)
     x = img_tensor
     for i in range(8): 
         x = model.deep_extractor[i](x)
     
     features = x 
-    features.retain_grad()
+    features.retain_grad() # Save gradients for this specific layer
     
     # Finish the forward pass
     x = model.deep_extractor[8](features)
@@ -109,9 +109,11 @@ if uploaded_file is not None and model_loaded:
     
     prob = torch.sigmoid(output).item()
     
-    # THE FIX: ALWAYS calculate gradients for the Malignant class. 
-    # No polarity flipping. Just straight math.
-    output.backward()
+    # THE POLARITY FIX: Mathematically ask the model what supports its specific decision
+    if prob >= 0.5:
+        output.backward() # What makes this Malignant?
+    else:
+        (-output).backward() # What makes this Benign?
     
     # Extract gradients and activations
     grads = features.grad[0] 
@@ -125,23 +127,21 @@ if uploaded_file is not None and model_loaded:
     cam = np.maximum(cam, 0)
     
     # Normalize between 0 and 1
-    cam_min, cam_max = np.min(cam), np.max(cam)
-    if cam_max > cam_min:
-        cam = (cam - cam_min) / (cam_max - cam_min)
-    else:
-        cam = np.zeros_like(cam)
+    cam_max = np.max(cam)
+    if cam_max > 0:
+        cam = cam / cam_max
 
     # --- 6. SIMPLE, CLEAN OVERLAY ---
     orig_img_array = np.array(image)
     
-    # Resize the heatmap to match the original image size smoothly
+    # Resize the heatmap to match the original image smoothly
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
     
     # Apply colormap
     heatmap_color = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Simple Alpha Blending: Where the CAM is cold (0), keep it perfectly transparent
+    # Simple Alpha Blending: Keeps the empty background dark and transparent
     alpha = cam_resized[..., np.newaxis] * 0.5 
     overlay = (orig_img_array * (1 - alpha) + heatmap_color * alpha).astype(np.uint8)
 
