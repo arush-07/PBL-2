@@ -89,43 +89,26 @@ if uploaded_file is not None and model_loaded:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
+    # No gradients needed! 100% stable.
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. THE FOOLPROOF GRAD-CAM (Using Direct Tensor Gradients) ---
-    model.zero_grad()
-    
-    # Step A: Forward pass through the visual backbone ONLY
-    visual_features = model.deep_extractor(img_tensor)
-    
-    # Step B: Tell PyTorch to save the gradients for this specific 3D feature map
-    visual_features.retain_grad()
-    
-    # Step C: Finish the forward pass manually
-    flattened_features = torch.flatten(visual_features, 1)
-    fused_features = model.fusion_module(flattened_features, dummy_radiomics)
-    output = model.classifier(fused_features)
-    
-    prob = torch.sigmoid(output).item()
-    
-    # Step D: Backward pass (with polarity fix)
-    if prob >= 0.5:
-        output.backward() # Malignant
-    else:
-        (-output).backward() # Benign
+    # --- 5. FORWARD PASS ---
+    with torch.no_grad():
+        # Get the raw 3D feature map from the visual backbone
+        visual_features = model.deep_extractor(img_tensor)
         
-    # Step E: Extract the exact activations and gradients directly from the tensor
-    activations = visual_features.detach()[0] # Shape: [2048, 7, 7]
-    grads = visual_features.grad.detach()[0]  # Shape: [2048, 7, 7]
+        # Finish the math for the prediction
+        flattened_features = torch.flatten(visual_features, 1)
+        fused_features = model.fusion_module(flattened_features, dummy_radiomics)
+        output = model.classifier(fused_features)
+        prob = torch.sigmoid(output).item()
+        
+    # --- 6. GENERATE TISSUE ACTIVATION MAP ---
+    # Shape is [2048, 7, 7]. We average across all 2048 filters to find the hottest spatial regions.
+    activations = visual_features.cpu().numpy()[0]
+    cam = np.mean(activations, axis=0)
     
-    # --- 6. GENERATE HEATMAP ---
-    # Calculate weights by averaging gradients spatially
-    weights = torch.mean(grads, dim=[1, 2], keepdim=True)
-    
-    # Multiply activations by weights and sum across channels
-    cam = torch.sum(weights * activations, dim=0).cpu().numpy()
-    
-    # ReLU: Keep only positive influences
     cam = np.maximum(cam, 0)
     
     # Normalize safely
@@ -135,26 +118,27 @@ if uploaded_file is not None and model_loaded:
     else:
         cam = np.zeros_like(cam)
 
-    # --- 7. CREATE HIGH-RES OVERLAY ---
+    # Stretch smoothly to original image resolution
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
-    # Clean up low-level noise
+    # Erase low-level background static
     cam[cam < 0.2] = 0.0  
     
+    # Create the high-res overlay
     orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Dynamic alpha mask
+    # Dynamic alpha mask for a clean clinical look
     alpha_mask = np.expand_dims(cam ** 1.5, axis=2) * 0.65 
     overlay = (heatmap * alpha_mask) + (orig_img_array * (1 - alpha_mask))
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='Direct Tensor Grad-CAM', use_container_width=True)
+        st.image(overlay, caption='ResNet50 Tissue Activation Map', use_container_width=True)
 
-    # --- 8. DISPLAY RESULTS ---
+    # --- 7. DISPLAY RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
     
