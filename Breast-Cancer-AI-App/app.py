@@ -95,7 +95,7 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. ORIGINAL HOOKS ---
+    # --- 5. STANDARD GRAD-CAM HOOKS ---
     feature_blobs = []
     backward_blobs = []
 
@@ -105,18 +105,20 @@ if uploaded_file is not None and model_loaded:
     def backward_hook(module, grad_input, grad_output):
         backward_blobs.append(grad_output[0])
 
-    target_layer = model.deep_extractor[7]
+    # THE FIX: Target Layer 3 (Index 6) instead of Layer 4.
+    # This provides a 14x14 grid, perfectly avoiding the corner padding glitches.
+    target_layer = model.deep_extractor[6]
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. DEBUGGED PREDICTION ---
+    # --- 6. PREDICTION ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
     output.backward() 
     
-    # --- 7. DEBUGGED HEATMAP ---
+    # --- 7. HEATMAP GENERATION ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
@@ -128,7 +130,8 @@ if uploaded_file is not None and model_loaded:
     cam = np.maximum(cam, 0) 
     
     orig_width, orig_height = image.size
-    cam = cv2.resize(cam, (orig_width, orig_height))
+    # Smooth interpolation so the heatmap isn't blocky
+    cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
@@ -143,12 +146,12 @@ if uploaded_file is not None and model_loaded:
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Use CAM values as alpha to remove the solid blue background block
+    # Clean alpha blending
     alpha = np.expand_dims(cam, axis=2) * 0.6 
     overlay = (heatmap * alpha + orig_img_array * (1 - alpha)).astype(np.uint8)
 
     with col2:
-        st.image(overlay, caption='Grad-CAM Attention Map', use_container_width=True)
+        st.image(overlay, caption='Layer 3 Grad-CAM Map', use_container_width=True)
 
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
