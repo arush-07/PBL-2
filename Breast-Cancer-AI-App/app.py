@@ -6,12 +6,11 @@ import torchvision.models as models
 from torchvision import transforms
 from PIL import Image
 import numpy as np
-import cv2
 
 # --- 1. SET UP THE PAGE ---
 st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Focused Grad-CAM Map.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction.")
 
 # --- 2. DEFINE THE AI ARCHITECTURE ---
 @st.cache_resource 
@@ -75,78 +74,29 @@ except Exception as e:
 uploaded_file = st.file_uploader("Choose a medical image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None and model_loaded:
-    col1, col2 = st.columns(2, gap="large")
-    
     image = Image.open(uploaded_file).convert('RGB')
-    with col1:
-        st.image(image, caption='Original Scan', use_container_width=True)
     
-    # --- 4. PREPARE IMAGE ---
+    # Display the original scan centered
+    st.image(image, caption='Original Scan', use_container_width=True)
+    
+    # --- 4. PREPARE IMAGE & PREDICT ---
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
+    
     img_tensor = transform(image).unsqueeze(0).to(device)
-    img_tensor.requires_grad = True 
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. CALCULATE GRAD-CAM ---
-    model.zero_grad()
-    
-    x = img_tensor
-    for i in range(8): 
-        x = model.deep_extractor[i](x)
-    
-    features = x
-    features.retain_grad()
-    
-    x = model.deep_extractor[8](x) 
-    flattened = torch.flatten(x, 1)
-    fused = model.fusion_module(flattened, dummy_radiomics)
-    output = model.classifier(fused)
-    
-    prob = torch.sigmoid(output).item()
-    
-    # Always target the malignant class for visualization
-    output.backward() 
-    
-    grads = features.grad[0]
-    acts = features.detach()[0]
-    weights = torch.mean(grads, dim=(1, 2), keepdim=True)
-    cam = torch.sum(weights * acts, dim=0).cpu().numpy()
-    cam = np.maximum(cam, 0) 
-    
-    cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam) + 1e-10)
-    
-    # --- 6. APPLY SPATIAL MASKING FIX ---
-    orig_img_array = np.array(image)
-    cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
-    
-    # THE FIX: Create a mask of the tissue (anything not pitch black)
-    gray = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
-    _, tissue_mask = cv2.threshold(gray, 15, 1, cv2.THRESH_BINARY)
-    
-    # Clean the mask to ignore small artifacts like text
-    kernel = np.ones((5,5), np.uint8)
-    tissue_mask = cv2.morphologyEx(tissue_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
-    
-    # Erase any heat outside the tissue mask
-    cam_final = cam_resized * tissue_mask
-    
-    # --- 7. RENDER OVERLAY ---
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_final), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    
-    alpha = np.expand_dims(cam_final, axis=2) * 0.5
-    overlay = (orig_img_array * (1 - alpha) + heatmap * alpha).astype(np.uint8)
+    with torch.no_grad():
+        output = model(img_tensor, dummy_radiomics)
+        prob = torch.sigmoid(output).item()
 
-    with col2:
-        st.image(overlay, caption='Focused Grad-CAM Map', use_container_width=True)
-
-    # --- 8. RESULTS ---
+    # --- 5. RESULTS ---
     st.markdown("---")
     confidence = max(prob, 1 - prob) * 100
+    
     if prob >= 0.5:
         st.error(f"### ⚠️ Diagnosis: Malignant")
     else:
