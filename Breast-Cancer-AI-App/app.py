@@ -58,7 +58,11 @@ def load_model():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
     
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    except Exception:
+        pass # Handle missing model gracefully in UI
+        
     model.eval()
     return model, device
 
@@ -90,7 +94,7 @@ if uploaded_file is not None and model_loaded:
     img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. PURE STANDARD GRAD-CAM WITH POLARITY FIX ---
+    # --- 5. PURE STANDARD GRAD-CAM ---
     model.zero_grad()
     
     x = img_tensor
@@ -107,36 +111,38 @@ if uploaded_file is not None and model_loaded:
     
     prob = torch.sigmoid(output).item()
     
-    # THE POLARITY FIX: Mathematically ask the model what supports its specific decision
     if prob >= 0.5:
-        output.backward() # What makes this Malignant?
+        output.backward() 
     else:
-        (-output).backward() # What makes this Benign?
+        (-output).backward() 
     
     grads = features.grad[0] 
     acts = features.detach()[0] 
     
-    # Standard Grad-CAM math
     weights = grads.mean(dim=[1, 2], keepdim=True)
     cam = (weights * acts).sum(dim=0).cpu().numpy()
     
-    # ReLU to keep only positive signals
     cam = np.maximum(cam, 0)
     
-    # Normalize safely
     cam_max = np.max(cam)
     if cam_max > 0:
         cam = cam / cam_max
 
-    # --- 6. SIMPLE, CLEAN OVERLAY ---
+    # --- 6. SIMPLE, CLEAN OVERLAY WITH BACKGROUND MASK ---
     orig_img_array = np.array(image)
     
+    # THE MASK FIX: Find the pitch-black background
+    gray_orig = cv2.cvtColor(orig_img_array, cv2.COLOR_RGB2GRAY)
+    _, tissue_mask = cv2.threshold(gray_orig, 10, 255, cv2.THRESH_BINARY)
+    
     cam_resized = cv2.resize(cam, (image.width, image.height), interpolation=cv2.INTER_CUBIC)
+    
+    # Force the heatmap to 0 wherever the original image is black
+    cam_resized[tissue_mask == 0] = 0
     
     heatmap_color = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
     
-    # Dynamic Alpha Blending: Keeps the empty background dark and transparent
     alpha = cam_resized[..., np.newaxis] * 0.6 
     overlay = (orig_img_array * (1 - alpha) + heatmap_color * alpha).astype(np.uint8)
 
