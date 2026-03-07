@@ -11,7 +11,7 @@ import cv2
 # --- 1. SET UP THE PAGE ---
 st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", layout="centered")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM visualization.")
+st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Tissue Activation Map.")
 
 # --- 2. DEFINE THE ADVANCED AI ARCHITECTURE ---
 @st.cache_resource 
@@ -80,7 +80,7 @@ if uploaded_file is not None and model_loaded:
     with col1:
         st.image(image, caption='Original Scan', use_container_width=True)
     
-    st.write("🔍 Analyzing image features and generating Grad-CAM...")
+    st.write("🔍 Analyzing image features and generating Activation Map...")
     
     # --- 4. PREPARE IMAGE ---
     transform = transforms.Compose([
@@ -89,51 +89,31 @@ if uploaded_file is not None and model_loaded:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    # IMPORTANT: Enable gradients on the input image for CAM calculation
-    img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
+    # No gradients required for Activation Mapping!
+    img_tensor = transform(image).unsqueeze(0).to(device)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. GRAD-CAM HOOKS ---
+    # --- 5. FORWARD HOOK (No Backward Pass) ---
     feature_blobs = []
-    backward_blobs = []
-
     def forward_hook(module, input, output):
         feature_blobs.append(output)
 
-    def backward_hook(module, grad_input, grad_output):
-        backward_blobs.append(grad_output[0])
-
     target_layer = model.deep_extractor[7]
     handle_fw = target_layer.register_forward_hook(forward_hook)
-    handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-   # --- 6. MAKE PREDICTION & POLARITY ---
-    model.zero_grad()
-    output = model(img_tensor, dummy_radiomics)
-    prob = torch.sigmoid(output).item()
+    # --- 6. MAKE PREDICTION ---
+    with torch.no_grad():
+        output = model(img_tensor, dummy_radiomics)
+        prob = torch.sigmoid(output).item()
     
-    # Ask the model what features correlate with its specific decision
-    if prob >= 0.5:
-        output.backward() # Calculates gradients for Malignan
-    else:
-        (-output).backward() # Calculates gradients for Benign
+    handle_fw.remove()
     
-    # --- 7. GENERATE TRUE CLINICAL GRAD-CAM ---
-    activations = feature_blobs[0][0].cpu().detach().numpy()
-    grads = backward_blobs[0][0].cpu().detach().numpy()
+    # --- 7. GENERATE FEATURE ACTIVATION MAP ---
+    # Shape is (2048, 7, 7). We take the mean across all 2048 filters to see what the backbone is focused on overall.
+    activations = feature_blobs[0][0].cpu().numpy()
+    cam = np.mean(activations, axis=0)
     
-    # THE FIX: Raw gradients only. No np.abs()! 
-    # We only want features that push the prediction in the direction we asked for.
-    weights = np.mean(grads, axis=(1, 2))
-    
-    cam = np.zeros(activations.shape[1:], dtype=np.float32)
-    for i, w in enumerate(weights):
-        cam += w * activations[i, :, :]
-        
-    # ReLU Filter: Erase everything that isn't actively contributing to our target class
-    cam = np.maximum(cam, 0) 
-    
-    # Normalize safely
+    # Normalize safely between 0 and 1
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
@@ -144,11 +124,8 @@ if uploaded_file is not None and model_loaded:
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
     
-    # A gentle noise filter (reduced from 0.3 to 0.2 to not accidentally erase faint tumors)
-    cam[cam < 0.2] = 0.0  
-    
-    handle_fw.remove()
-    handle_bw.remove()
+    # Noise filter to drop background static
+    cam[cam < 0.4] = 0.0  
     
     # Create overlay
     orig_img_array = np.array(image)
@@ -161,7 +138,7 @@ if uploaded_file is not None and model_loaded:
     overlay = np.uint8(overlay)
 
     with col2:
-        st.image(overlay, caption='True Grad-CAM Attention Map', use_container_width=True)
+        st.image(overlay, caption='ResNet50 Tissue Activation Map', use_container_width=True)
 
     # --- 8. DISPLAY RESULTS ---
     st.markdown("---")
