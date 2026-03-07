@@ -5,12 +5,10 @@ import torch.nn as nn
 import torchvision.models as models
 from torchvision import transforms
 from PIL import Image
-import numpy as np
 
 # --- 1. SET UP THE PAGE ---
-st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="centered")
+st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="wide")
 st.title("🩺 AI Breast Cancer Diagnosis")
-st.write("Upload a mammogram or ultrasound image to get an instant AI prediction.")
 
 # --- 2. DEFINE THE AI ARCHITECTURE ---
 @st.cache_resource 
@@ -71,13 +69,17 @@ except Exception as e:
     model_loaded = False
 
 # --- 3. UI: IMAGE UPLOAD ---
-uploaded_file = st.file_uploader("Choose a medical image...", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload a mammogram or ultrasound image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None and model_loaded:
+    # Create two columns: left for image (width 2), right for results (width 1)
+    col1, col2 = st.columns([2, 1], gap="medium")
+    
     image = Image.open(uploaded_file).convert('RGB')
     
-    # Display the original scan centered
-    st.image(image, caption='Original Scan', use_container_width=True)
+    with col1:
+        # 'use_container_width=False' and 'width=500' keeps the image from becoming huge
+        st.image(image, caption='Uploaded Scan', width=500)
     
     # --- 4. PREPARE IMAGE & PREDICT ---
     transform = transforms.Compose([
@@ -93,14 +95,17 @@ if uploaded_file is not None and model_loaded:
         output = model(img_tensor, dummy_radiomics)
         prob = torch.sigmoid(output).item()
 
-    # --- 5. RESULTS ---
-    st.markdown("---")
-    confidence = max(prob, 1 - prob) * 100
-    
-    if prob >= 0.5:
-        st.error(f"### ⚠️ Diagnosis: Malignant")
-    else:
-        st.success(f"### ✅ Diagnosis: Benign")
+    # --- 5. RESULTS (IN THE RIGHT COLUMN) ---
+    with col2:
+        st.subheader("Analysis Results")
+        confidence = max(prob, 1 - prob) * 100
         
-    st.write(f"**Confidence:** {confidence:.2f}%")
-    st.progress(int(confidence))
+        if prob >= 0.5:
+            st.error("### ⚠️ Malignant")
+        else:
+            st.success("### ✅ Benign")
+            
+        st.write(f"**AI Confidence:** {confidence:.2f}%")
+        st.progress(int(confidence))
+        
+        st.info("Note: This is an AI-generated analysis and should be verified by a medical professional.")
