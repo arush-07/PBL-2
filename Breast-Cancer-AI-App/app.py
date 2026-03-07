@@ -13,7 +13,7 @@ st.set_page_config(page_title="Breast Cancer AI Assistant", page_icon="🩺", la
 st.title("🩺 AI Breast Cancer Diagnosis")
 st.write("Upload a mammogram or ultrasound image to get an instant AI prediction and Grad-CAM visualization.")
 
-# --- 2. DEFINE THE ORIGINAL ARCHITECTURE ---
+# --- 2. DEFINE ORIGINAL ARCHITECTURE ---
 @st.cache_resource 
 def load_model():
     class AttentionFusion(nn.Module):
@@ -61,7 +61,7 @@ def load_model():
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     except Exception:
-        pass # Streamlit handles the error below
+        pass
         
     model.eval()
     return model, device
@@ -71,7 +71,6 @@ try:
     model_loaded = True
 except Exception as e:
     st.error(f"Error loading model: {e}")
-    st.info("Ensure 'adaptive_hybrid_breast_cancer_model.pth' is uploaded to the same folder.")
     model_loaded = False
 
 # --- 3. UI: IMAGE UPLOAD ---
@@ -93,11 +92,10 @@ if uploaded_file is not None and model_loaded:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    # Enable gradients on the input image
     img_tensor = transform(image).unsqueeze(0).to(device).requires_grad_(True)
     dummy_radiomics = torch.zeros((1, 42)).to(device) 
     
-    # --- 5. ORIGINAL GRAD-CAM HOOKS ---
+    # --- 5. ORIGINAL HOOKS ---
     feature_blobs = []
     backward_blobs = []
 
@@ -111,15 +109,14 @@ if uploaded_file is not None and model_loaded:
     handle_fw = target_layer.register_forward_hook(forward_hook)
     handle_bw = target_layer.register_full_backward_hook(backward_hook)
     
-    # --- 6. DEBUGGED PREDICTION AND GRADIENTS ---
+    # --- 6. DEBUGGED PREDICTION ---
     model.zero_grad()
     output = model(img_tensor, dummy_radiomics)
     prob = torch.sigmoid(output).item()
     
-    # DEBUG FIX: Always backpropagate the actual output. No if/else polarity flips.
     output.backward() 
     
-    # --- 7. DEBUGGED HEATMAP GENERATION ---
+    # --- 7. DEBUGGED HEATMAP ---
     activations = feature_blobs[0][0].cpu().detach().numpy()
     grads = backward_blobs[0][0].cpu().detach().numpy()
     
@@ -128,13 +125,11 @@ if uploaded_file is not None and model_loaded:
     for i, w in enumerate(weights):
         cam += w * activations[i, :, :]
         
-    cam = np.maximum(cam, 0) # Keep positive signals
+    cam = np.maximum(cam, 0) 
     
-    # DEBUG FIX: Resize accurately to original dimensions
     orig_width, orig_height = image.size
     cam = cv2.resize(cam, (orig_width, orig_height))
     
-    # Normalize
     cam_min, cam_max = np.min(cam), np.max(cam)
     if cam_max > cam_min:
         cam = (cam - cam_min) / (cam_max - cam_min)
@@ -144,13 +139,12 @@ if uploaded_file is not None and model_loaded:
     handle_fw.remove()
     handle_bw.remove()
     
-    # DEBUG FIX: Dynamic Alpha Blending to remove the blue background
     orig_img_array = np.array(image)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    # Tying transparency to the heat itself
-    alpha = np.expand_dims(cam, axis=2) * 0.5 
+    # Use CAM values as alpha to remove the solid blue background block
+    alpha = np.expand_dims(cam, axis=2) * 0.6 
     overlay = (heatmap * alpha + orig_img_array * (1 - alpha)).astype(np.uint8)
 
     with col2:
