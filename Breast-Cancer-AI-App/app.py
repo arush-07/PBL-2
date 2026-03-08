@@ -53,7 +53,7 @@ def load_model():
     model = HybridBreastCancerModel(radiomic_feature_count=42).to(device)
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model1.pth')
+    MODEL_PATH = os.path.join(BASE_DIR, 'adaptive_hybrid_breast_cancer_model.pth')
     
     if os.path.exists(MODEL_PATH):
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
