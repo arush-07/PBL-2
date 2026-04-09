@@ -62,7 +62,7 @@ def load_pytorch_model():
 @st.cache_resource
 def load_rf_model():
     try:
-        return joblib.load('cancer_model.pkl'), True
+        return joblib.load('breast_model.pkl'), True
     except Exception as e:
         return None, False
 
@@ -132,7 +132,7 @@ with tab2:
     st.info("Input the 30 standard features from the Wisconsin Breast Cancer Dataset.")
     
     if not rf_loaded:
-        st.error("Random Forest model file (`cancer_model.pkl`) not found. Please ensure you downloaded it from the notebook and placed it in this folder.")
+        st.error("Random Forest model file (`breast_model.pkl`) not found. Please ensure you downloaded it from the notebook and placed it in this folder.")
     else:
         # The complete list of 30 features matching your Random Forest model
         features = [
