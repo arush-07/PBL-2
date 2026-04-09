@@ -54,9 +54,9 @@ def load_pytorch_model():
 
             # 🔥 MATCH TRAINED CLASSIFIER
             self.classifier = nn.Sequential(
-                nn.Linear(2048, 128),
+                nn.Linear(2048, 512),
                 nn.ReLU(),
-                nn.Linear(128, 1)
+                nn.Linear(512, 1)   
             )
 
         def forward(self, img, radiomics):
