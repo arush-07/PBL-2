@@ -8,21 +8,22 @@ import joblib
 import numpy as np
 import os
 
-# --- 1. SET UP PATH ---
+# ---------------- PATH ----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# --- 2. PAGE CONFIG ---
+# ---------------- PAGE ----------------
 st.set_page_config(page_title="AI Breast Cancer Diagnosis", page_icon="🩺", layout="wide")
 st.title("🩺 AI Breast Cancer Diagnosis System")
 
-# --- DEBUG (REMOVE LATER) ---
+# ---------------- DEBUG ----------------
 st.write("📂 Current Directory:", BASE_DIR)
 st.write("📁 Files:", os.listdir(BASE_DIR))
 
-# --- 3. LOAD MODELS ---
+# ---------------- MODELS ----------------
 
 @st.cache_resource
 def load_pytorch_model():
+
     class AttentionFusion(nn.Module):
         def __init__(self, radiomic_feature_count=42):
             super().__init__()
@@ -37,30 +38,48 @@ def load_pytorch_model():
             r = self.radiomic_projection(r_raw)
             concat = torch.cat((v, r), dim=1)
             attn = self.attention_network(concat)
-            attn_weights = torch.softmax(attn, dim=1)
-            return v * attn_weights[:, 0:1] + r * attn_weights[:, 1:2]
+            weights = torch.softmax(attn, dim=1)
+            return v * weights[:, 0:1] + r * weights[:, 1:2]
+
 
     class HybridBreastCancerModel(nn.Module):
         def __init__(self, radiomic_feature_count=42):
             super().__init__()
+
+            # 🔥 MATCH TRAINED MODEL
             resnet = models.resnet50(weights=None)
-            self.visual_extractor = nn.Sequential(*list(resnet.children())[:-1])
-            self.fusion_module = AttentionFusion(radiomic_feature_count)
-            self.classifier = nn.Linear(2048, 1)
+            self.deep_extractor = nn.Sequential(*list(resnet.children())[:-1])
+
+            self.fusion = AttentionFusion(radiomic_feature_count)
+
+            # 🔥 MATCH TRAINED CLASSIFIER
+            self.classifier = nn.Sequential(
+                nn.Linear(2048, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1)
+            )
 
         def forward(self, img, radiomics):
-            v_features = self.visual_extractor(img).squeeze()
-            if len(v_features.shape) == 1:
-                v_features = v_features.unsqueeze(0)
-            fused = self.fusion_module(v_features, radiomics)
+            v = self.deep_extractor(img).squeeze()
+
+            if len(v.shape) == 1:
+                v = v.unsqueeze(0)
+
+            fused = self.fusion(v, radiomics)
             return self.classifier(fused)
 
     try:
         model_path = os.path.join(BASE_DIR, "adaptive_hybrid_breast_cancer_model.pth")
+
         model = HybridBreastCancerModel()
-        model.load_state_dict(torch.load(model_path, map_location='cpu'))
+
+        # 🔥 FIX: allow mismatch keys
+        state_dict = torch.load(model_path, map_location='cpu')
+        model.load_state_dict(state_dict, strict=False)
+
         model.eval()
         return model, True
+
     except Exception as e:
         st.error(f"❌ PyTorch Load Error: {e}")
         return None, False
@@ -84,6 +103,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if pytorch_loaded:
     pytorch_model = pytorch_model.to(device)
 
+# ---------------- IMAGE TRANSFORM ----------------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -91,7 +111,7 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# --- 4. TABS ---
+# ---------------- UI ----------------
 st.write("### Select Data Input Method")
 tab1, tab2, tab3 = st.tabs([
     "🖼️ Image Scan (PyTorch)",
@@ -99,7 +119,7 @@ tab1, tab2, tab3 = st.tabs([
     "🤝 Hybrid Mode"
 ])
 
-# ------------------ TAB 1 ------------------
+# ---------------- TAB 1 ----------------
 with tab1:
     st.info("Upload a medical scan to analyze visual features.")
 
@@ -121,30 +141,38 @@ with tab1:
                     prob = torch.sigmoid(out).item()
 
                 st.write("### Result")
-                if prob > 0.5:
-                    st.error(f"⚠️ Malignant ({prob*100:.2f}%)")
-                else:
-                    st.success(f"✅ Benign ({(1-prob)*100:.2f}%)")
 
-# ------------------ TAB 2 ------------------
+                if prob > 0.5:
+                    st.error(f"⚠️ HIGH RISK (Malignant)\nConfidence: {prob*100:.2f}%")
+                else:
+                    st.success(f"✅ LOW RISK (Benign)\nConfidence: {(1-prob)*100:.2f}%")
+
+# ---------------- TAB 2 ----------------
 with tab2:
     st.write("### Enter Clinical Measurements")
 
     if not rf_loaded:
         st.error("Random Forest model not loaded.")
     else:
-        features = [st.number_input(f"Feature {i+1}", value=0.0) for i in range(30)]
+        features = []
+        cols = st.columns(3)
+
+        for i in range(30):
+            with cols[i % 3]:
+                val = st.number_input(f"Feature {i+1}", value=0.0)
+                features.append(val)
 
         if st.button("Run Clinical Analysis"):
             data = np.array(features).reshape(1, -1)
             prob = rf_model.predict_proba(data)[0][0]
 
             st.write("### Result")
-            if prob > 0.85:
-                st.error(f"⚠️ Malignant ({prob*100:.2f}%)")
-            else:
-                st.success(f"✅ Benign ({prob*100:.2f}%)")
 
-# ------------------ TAB 3 ------------------
+            if prob > 0.85:
+                st.error(f"⚠️ HIGH RISK (Malignant)\nProbability: {prob*100:.2f}%")
+            else:
+                st.success(f"✅ LOW RISK (Benign)\nProbability: {prob*100:.2f}%")
+
+# ---------------- TAB 3 ----------------
 with tab3:
     st.warning("Hybrid mode coming soon 🚀")
