@@ -62,6 +62,7 @@ def load_pytorch_model():
 @st.cache_resource
 def load_rf_model():
     try:
+        # Updated to load your specific 'breast_model.pkl' file
         return joblib.load('breast_model.pkl'), True
     except Exception as e:
         return None, False
