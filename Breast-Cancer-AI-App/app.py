@@ -40,19 +40,24 @@ def load_pytorch_model():
             weights = torch.softmax(attn, dim=1)
             return v * weights[:, 0:1] + r * weights[:, 1:2]
 
+
     class HybridBreastCancerModel(nn.Module):
         def __init__(self, radiomic_feature_count=42):
             super().__init__()
 
             resnet = models.resnet50(weights=None)
+
+            # ✅ MATCH NAME
             self.deep_extractor = nn.Sequential(*list(resnet.children())[:-1])
 
-            self.fusion = AttentionFusion(radiomic_feature_count)
+            # ✅ MATCH NAME
+            self.fusion_module = AttentionFusion(radiomic_feature_count)
 
-            # ✅ CORRECT CLASSIFIER (512)
+            # ✅ MATCH STRUCTURE (with dropout layer)
             self.classifier = nn.Sequential(
                 nn.Linear(2048, 512),
                 nn.ReLU(),
+                nn.Dropout(0.5),   # 🔥 IMPORTANT
                 nn.Linear(512, 1)
             )
 
@@ -62,19 +67,23 @@ def load_pytorch_model():
             if len(v.shape) == 1:
                 v = v.unsqueeze(0)
 
-            fused = self.fusion(v, radiomics)
+            fused = self.fusion_module(v, radiomics)
             return self.classifier(fused)
 
     try:
         model_path = os.path.join(BASE_DIR, "adaptive_hybrid_breast_cancer_model.pth")
+
         model = HybridBreastCancerModel()
+
+        # 🔥 STRICT = TRUE now works
         model.load_state_dict(torch.load(model_path, map_location='cpu'))
+
         model.eval()
         return model, True
+
     except Exception as e:
         st.error(f"❌ PyTorch Load Error: {e}")
         return None, False
-
 
 @st.cache_resource
 def load_rf_model():
